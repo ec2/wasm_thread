@@ -302,7 +302,7 @@ impl Builder {
         scope_data: Option<Arc<ScopeData>>,
     ) -> std::io::Result<JoinInner<'static, T>>
     where
-        F: AsyncClosure<T> + 'static,
+        F: AsyncClosure<T> + Send + 'static,
         T: Send + 'static,
     {
         let my_signal = Arc::new(Signal::new());
@@ -316,34 +316,35 @@ impl Builder {
         let their_packet = my_packet.clone();
 
         let f = MaybeDangling::new(f);
-        let spawn_local = wasm_bindgen_futures::spawn_local(async move {
-            // SAFETY: we constructed `f` initialized.
-            let f = f.into_inner();
-            // Execute the closure and catch any panics
-            
-            let try_result = Ok(f.call_once().await);
-
-            // SAFETY: `their_packet` as been built just above and moved by the
-            // closure (it is an Arc<...>) and `my_packet` will be stored in the
-            // same `JoinInner` as this closure meaning the mutation will be
-            // safe (not modify it and affect a value far away).
-            unsafe { *their_packet.result.get() = Some(try_result) };
-            // Here `their_packet` gets dropped, and if this is the last `Arc` for that packet that
-            // will call `decrement_num_running_threads` and therefore signal that this thread is
-            // done.
-            drop(their_packet);
-            // Notify waiting handles
-            their_signal.signal();
-            // Here, the lifetime `'a` and even `'scope` can end, so the thread can be closed. `main` keeps running for a bit
-            // after that before returning itself.
-            #[cfg(not(feature = "keep_worker_alive"))]
-            js_sys::eval("self")
-                .unwrap()
-                .dyn_into::<DedicatedWorkerGlobalScope>()
-                .unwrap()
-                .close();
+        let main = Box::new(move || {
+            wasm_bindgen_futures::spawn_local(async move {
+                // SAFETY: we constructed `f` initialized.
+                let f = f.into_inner();
+                // Execute the closure and catch any panics
+                
+                let try_result = Ok(f.call_once().await);
+    
+                // SAFETY: `their_packet` as been built just above and moved by the
+                // closure (it is an Arc<...>) and `my_packet` will be stored in the
+                // same `JoinInner` as this closure meaning the mutation will be
+                // safe (not modify it and affect a value far away).
+                unsafe { *their_packet.result.get() = Some(try_result) };
+                // Here `their_packet` gets dropped, and if this is the last `Arc` for that packet that
+                // will call `decrement_num_running_threads` and therefore signal that this thread is
+                // done.
+                drop(their_packet);
+                // Notify waiting handles
+                their_signal.signal();
+                // Here, the lifetime `'a` and even `'scope` can end, so the thread can be closed. `main` keeps running for a bit
+                // after that before returning itself.
+                #[cfg(not(feature = "keep_worker_alive"))]
+                js_sys::eval("self")
+                    .unwrap()
+                    .dyn_into::<DedicatedWorkerGlobalScope>()
+                    .unwrap()
+                    .close();
+            });
         });
-        let main = Box::new(move || spawn_local );
 
         // Erase lifetime
         let context = WebWorkerContext {
