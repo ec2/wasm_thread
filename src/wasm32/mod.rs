@@ -70,12 +70,13 @@ impl WorkerMessage {
     }
 }
 
+#[cfg(not(feature = "no-bundler"))]
 fn _ensure_worker_emitted() {
     // Just ensure that the worker is emitted into the output folder, but don't actually use the URL.
-    wasm_bindgen::link_to!(module = "/src/wasm32/js/web_worker_module.js");
+    wasm_bindgen::link_to!(module = "/src/wasm32/js/web_worker_module.bundler.js");
 }
-
-#[wasm_bindgen(module = "/src/wasm32/js/module_worker.js")]
+#[cfg(not(feature = "no-bundler"))]
+#[wasm_bindgen(module = "/src/wasm32/js/module_worker_start.js")]
 extern "C" {
     #[wasm_bindgen(js_name = startWorker)]
     fn start_worker() -> JsValue;
@@ -413,9 +414,17 @@ impl Builder {
         }
 
         // Spawn the worker
-        let worker: Worker = start_worker().unchecked_into();
+        let worker: Worker = {
+            #[cfg(not(feature = "no-bundler"))]
+            {
+                start_worker().unchecked_into()
+            }
+            #[cfg(feature = "no-bundler")]
+            {
+                Worker::new_with_options(script.as_str(), &options).unwrap()
+            }
+        };
         let worker = Rc::new(worker);
-        // let worker = Rc::new(Worker::new_with_options(script.as_str(), &options).unwrap());
 
         // Make copy and keep a reference in callback handler so that GC does not despawn worker
         let mut their_worker = Some(worker.clone());
