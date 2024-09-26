@@ -22,4 +22,3 @@ self.onmessage = event => {
         wasm.wasm_thread_entry_point(work);
     });
 };
-  

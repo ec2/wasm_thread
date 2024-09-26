@@ -2,9 +2,11 @@ pub use std::thread::{Result, Thread};
 use std::{
     cell::UnsafeCell,
     fmt,
+    future::Future,
     marker::PhantomData,
     mem,
     panic::{catch_unwind, AssertUnwindSafe},
+    pin::Pin,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -16,16 +18,12 @@ use utils::SpinLockMutex;
 pub use utils::{available_parallelism, get_wasm_bindgen_shim_script_path, get_worker_script, is_web_worker_thread};
 use wasm_bindgen::prelude::*;
 use web_sys::{DedicatedWorkerGlobalScope, Worker, WorkerOptions, WorkerType};
-use std::future::Future;
-use std::pin::Pin;
-
 
 mod scoped;
 mod signal;
 mod utils;
-
+use wasm_bindgen_futures::JsFuture;
 // Use a thread safe static hashmap to keep track of whether each thread can be closed
-
 
 struct WebWorkerContext {
     func: Box<dyn FnOnce() + Send>,
@@ -70,6 +68,17 @@ impl WorkerMessage {
             .post_message(&JsValue::from(Box::into_raw(req) as u32))
             .unwrap();
     }
+}
+
+fn _ensure_worker_emitted() {
+    // Just ensure that the worker is emitted into the output folder, but don't actually use the URL.
+    wasm_bindgen::link_to!(module = "/src/wasm32/js/web_worker_module.js");
+}
+
+#[wasm_bindgen(module = "/src/wasm32/js/module_worker.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = startWorker)]
+    fn start_worker() -> JsValue;
 }
 
 // Pass `f` in `MaybeUninit` because actually that closure might *run longer than the lifetime of `F`*.
@@ -178,7 +187,7 @@ impl Builder {
 
     /// Spawns a new thread by taking ownership of the `Builder`, and returns an
     /// [std::io::Result] to its [`JoinHandle`].
-    
+
     pub fn spawn<F, T>(self, f: F) -> std::io::Result<JoinHandle<T>>
     where
         F: FnOnce() -> T,
@@ -226,7 +235,7 @@ impl Builder {
     {
         Ok(JoinHandle(unsafe { self.spawn_unchecked_async_(f, None) }?))
     }
-    
+
     pub(crate) unsafe fn spawn_unchecked_<'a, 'scope, F, T>(
         self,
         f: F,
@@ -265,8 +274,8 @@ impl Builder {
             drop(their_packet);
             // Notify waiting handles
             their_signal.signal();
-            // Here, the lifetime `'a` and even `'scope` can end, so the thread can be closed. `main` keeps running for a bit
-            // after that before returning itself.
+            // Here, the lifetime `'a` and even `'scope` can end, so the thread can be closed. `main` keeps running for
+            // a bit after that before returning itself.
             #[cfg(not(feature = "keep_worker_alive"))]
             js_sys::eval("self")
                 .unwrap()
@@ -321,9 +330,9 @@ impl Builder {
                 // SAFETY: we constructed `f` initialized.
                 let f = f.into_inner();
                 // Execute the closure and catch any panics
-                
+
                 let try_result = Ok(f.call_once().await);
-    
+
                 // SAFETY: `their_packet` as been built just above and moved by the
                 // closure (it is an Arc<...>) and `my_packet` will be stored in the
                 // same `JoinInner` as this closure meaning the mutation will be
@@ -335,8 +344,8 @@ impl Builder {
                 drop(their_packet);
                 // Notify waiting handles
                 their_signal.signal();
-                // Here, the lifetime `'a` and even `'scope` can end, so the thread can be closed. `main` keeps running for a bit
-                // after that before returning itself.
+                // Here, the lifetime `'a` and even `'scope` can end, so the thread can be closed. `main` keeps running
+                // for a bit after that before returning itself.
                 #[cfg(not(feature = "keep_worker_alive"))]
                 js_sys::eval("self")
                     .unwrap()
@@ -375,10 +384,8 @@ impl Builder {
             wasm_bindgen_shim_url,
             ..
         } = self;
-
         // Get worker script as URL encoded blob
         let script = worker_script_url.unwrap_or(get_worker_script(wasm_bindgen_shim_url));
-
         // Todo: figure out how to set stack size
         let mut options = WorkerOptions::new();
         match (name, prefix) {
@@ -406,7 +413,9 @@ impl Builder {
         }
 
         // Spawn the worker
-        let worker = Rc::new(Worker::new_with_options(script.as_str(), &options).unwrap());
+        let worker: Worker = start_worker().unchecked_into();
+        let worker = Rc::new(worker);
+        // let worker = Rc::new(Worker::new_with_options(script.as_str(), &options).unwrap());
 
         // Make copy and keep a reference in callback handler so that GC does not despawn worker
         let mut their_worker = Some(worker.clone());
@@ -425,10 +434,24 @@ impl Builder {
                 }
             };
         }) as Box<dyn FnMut(&web_sys::MessageEvent)>);
-        worker.set_onmessage(Some(callback.as_ref().unchecked_ref()));
 
+        let err_callback = Closure::wrap(Box::new(move |x: &web_sys::MessageEvent| {
+            web_sys::console::log_1(&"Rust On msg err cb".into());
+            web_sys::console::log_1(x);
+        }) as Box<dyn FnMut(&web_sys::MessageEvent)>);
+
+        let e_callback = Closure::wrap(Box::new(move |x: &web_sys::Event| {
+            web_sys::console::log_1(&"Rust On Err".into());
+            web_sys::console::log_1(x);
+        }) as Box<dyn FnMut(&web_sys::Event)>);
+
+        worker.set_onmessage(Some(callback.as_ref().unchecked_ref()));
+        worker.set_onmessageerror(Some(err_callback.as_ref().unchecked_ref()));
+        worker.set_onerror(Some(e_callback.as_ref().unchecked_ref()));
         // TODO: cleanup this leak somehow
         callback.forget();
+        err_callback.forget();
+        e_callback.forget();
 
         let ctx_ptr = Box::into_raw(Box::new(ctx));
 
